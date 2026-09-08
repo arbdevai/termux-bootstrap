@@ -1,0 +1,22 @@
+# Local secrets and auth
+.env
+.env.*
+!.env.example
+*.token
+*.key
+*.pem
+
+# Local config that may contain credentials
+config.local.*
+secrets/
+.auth/
+
+# Runtime/cache
+.cache/
+*.log
+*.pid
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
