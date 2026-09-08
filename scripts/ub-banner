@@ -1,0 +1,18 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+if [ -z "${UB_CHROOT:-}" ]; then
+    printf '\033[1;34m'
+    printf '┌─────────────────────────────────────────┐\n'
+    printf '│  UBUNTU CHROOT                          │\n'
+    printf '├─────────────────────────────────────────┤\n'
+    printf '\033[0m'
+    printf '│  ub          masuk Ubuntu               │\n'
+    printf '│  ub status   cek proses + RAM           │\n'
+    printf '│  ub stop     matikan Ubuntu + 9router   │\n'
+    printf '│  ub reset    bersihkan + masuk ulang    │\n'
+    printf '│  ub scan     deep scan proses yatim     │\n'
+    printf '│  ub help     bantuan                    │\n'
+    printf '\033[1;34m'
+    printf '└─────────────────────────────────────────┘\n'
+    printf '\033[0m'
+fi
