@@ -1,0 +1,168 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+ROOTFS="/data/local/ubuntu-chroot"
+PREFIX="/data/data/com.termux/files/usr"
+SCRIPT="$PREFIX/bin/script"
+STATE_DIR="$PREFIX/tmp/ub-manager"
+LOCK_FILE="$STATE_DIR/session.pid"
+CLEAN_STAMP="$STATE_DIR/clean.stamp"
+
+mkdir -p "$STATE_DIR"
+
+R='\033[0m'; B='\033[1;34m'; G='\033[1;32m'; Y='\033[1;33m'; RED='\033[1;31m'; DIM='\033[2m'
+info(){ printf "${B}[UB]${R} %s\n" "$*"; }
+ok(){ printf "${G}[✓]${R} %s\n" "$*"; }
+warn(){ printf "${Y}[!]${R} %s\n" "$*"; }
+err(){ printf "${RED}[×]${R} %s\n" "$*" >&2; }
+die(){ err "$*"; exit 1; }
+now_ms(){ date +%s%3N 2>/dev/null || echo "$(( $(date +%s) * 1000 ))"; }
+elapsed(){ local s="$1" e; e="$(now_ms)"; awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2fs",(b-a)/1000}'; }
+mem_available_kb(){ awk '/^MemAvailable:/ {print $2}' /proc/meminfo; }
+swap_used_kb(){ awk '/^SwapTotal:/ {t=$2} /^SwapFree:/ {f=$2} END{print t-f}' /proc/meminfo; }
+fmt_gb(){ awk -v k="${1:-0}" 'BEGIN{printf "%.2f GB",k/1048576}'; }
+fmt_mb(){ awk -v k="${1:-0}" 'BEGIN{printf "%.0f MB",k/1024}'; }
+check_root(){ su -c true >/dev/null 2>&1 || die "Root access unavailable."; }
+check_rootfs(){ su -c "test -x '$ROOTFS/bin/bash'" >/dev/null 2>&1 || die "Ubuntu rootfs not found: $ROOTFS"; }
+read_lock_pid(){ [ -f "$LOCK_FILE" ] || return 1; local p; p="$(cat "$LOCK_FILE" 2>/dev/null)"; case "$p" in ''|*[!0-9]*) return 1;; esac; printf '%s\n' "$p"; }
+lock_is_alive(){ local p c; p="$(read_lock_pid)" || return 1; kill -0 "$p" >/dev/null 2>&1 || return 1; c="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"; case "$c" in *"/bin/ub"*) return 0;; esac; return 1; }
+create_lock(){ printf '%s\n' "$$" > "$LOCK_FILE"; rm -f "$CLEAN_STAMP"; }
+mark_clean(){ rm -f "$LOCK_FILE"; : > "$CLEAN_STAMP"; }
+
+spinner_wait(){
+    local p="$1" label="$2" s i=0 f rc
+    s="$(now_ms)"
+    while kill -0 "$p" 2>/dev/null; do
+        case "$i" in 0) f='|' ;; 1) f='/' ;; 2) f='-' ;; 3) f='\\' ;; esac
+        printf "\r${B}[%s]${R} %-32s %s" "$f" "$label" "$(elapsed "$s")"
+        i=$(( (i + 1) % 4 )); sleep 0.10
+    done
+    wait "$p"; rc=$?
+    if [ "$rc" -eq 0 ]; then printf "\r${G}[✓]${R} %-32s %s\n" "$label" "$(elapsed "$s")"; else printf "\r${RED}[×]${R} %-32s %s\n" "$label" "$(elapsed "$s")"; fi
+    return "$rc"
+}
+
+rootfs_pids(){
+    su -c '
+ROOTFS="/data/local/ubuntu-chroot"
+for d in /proc/[0-9]*; do
+  [ -e "$d/root" ] || continue
+  r="$(readlink "$d/root" 2>/dev/null)" || continue
+  case "$r" in "$ROOTFS"|"$ROOTFS/"*) echo "${d##*/}";; esac
+done
+'
+}
+
+wrapper_pids(){
+    su -c '
+ROOTFS="/data/local/ubuntu-chroot"
+ps -A -o PID=,NAME=,ARGS= 2>/dev/null | awk -v root="$ROOTFS" '\''($2=="sh"||$2=="bash"||$2=="script") && index($0,root)>0 {print $1}'\''
+'
+}
+
+full_scan(){
+    local out="$1" p ppid rss comm
+    : > "$out"
+    while IFS= read -r p; do
+        case "$p" in ''|*[!0-9]*) continue;; esac
+        [ -r "/proc/$p/status" ] || continue
+        ppid="$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null)"
+        rss="$(awk '/^VmRSS:/ {print $2}' "/proc/$p/status" 2>/dev/null)"
+        comm="$(cat "/proc/$p/comm" 2>/dev/null)"
+        [ -n "$ppid" ] || ppid=0; [ -n "$rss" ] || rss=0; [ -n "$comm" ] || comm=unknown
+        printf '%s|%s|%s|%s\n' "$p" "$ppid" "$rss" "$comm" >> "$out"
+    done < <(rootfs_pids)
+}
+
+show_status(){
+    check_root
+    local start state count=0 wrappers=0 rss_total=0 avail swap tmp="" bg pid ppid rss comm ram
+    start="$(now_ms)"; avail="$(mem_available_kb)"; swap="$(swap_used_kb)"
+    if [ -f "$CLEAN_STAMP" ] && [ ! -f "$LOCK_FILE" ]; then
+        state=STOPPED; ok "Clean state verified"
+    else
+        tmp="$STATE_DIR/status.$$"; rm -f "$tmp"; full_scan "$tmp" & bg=$!; spinner_wait "$bg" "Scanning Ubuntu processes"
+        count="$(wc -l < "$tmp" | tr -d ' ')"; rss_total="$(awk -F'|' '{s+=$3} END{print s+0}' "$tmp")"; wrappers="$(wrapper_pids | wc -l | tr -d ' ')"
+        if lock_is_alive; then state=RUNNING; elif [ "$count" -gt 0 ] || [ "$wrappers" -gt 0 ] || [ -f "$LOCK_FILE" ]; then state=ORPHANED; else state=STOPPED; mark_clean; fi
+    fi
+    echo
+    printf "${B}┌──────────────────────────────────────────────┐${R}\n"
+    printf "${B}│ UBUNTU CHROOT STATUS                         │${R}\n"
+    printf "${B}├──────────────────────────────────────────────┤${R}\n"
+    case "$state" in RUNNING) printf "│ State          ${G}RUNNING${R}\n";; ORPHANED) printf "│ State          ${Y}ORPHANED${R}\n";; *) printf "│ State          ${DIM}STOPPED${R}\n";; esac
+    printf "│ Processes      %s\n" "$count"; printf "│ Wrappers       %s\n" "$wrappers"; printf "│ Ubuntu RAM     %s\n" "$(fmt_mb "$rss_total")"; printf "│ RAM available  %s\n" "$(fmt_gb "$avail")"; printf "│ Swap used      %s\n" "$(fmt_gb "$swap")"; printf "${B}└──────────────────────────────────────────────┘${R}\n"
+    if [ -n "$tmp" ] && [ -s "$tmp" ]; then
+        echo; printf '%-7s %-7s %-9s %s\n' PID PPID RAM PROCESS; printf '%s\n' '--------------------------------------------------'
+        while IFS='|' read -r pid ppid rss comm; do ram="$(awk -v k="$rss" 'BEGIN{printf "%.1fM",k/1024}')"; printf '%-7s %-7s %-9s %s\n' "$pid" "$ppid" "$ram" "$comm"; done < "$tmp"
+    fi
+    [ -n "$tmp" ] && rm -f "$tmp"; echo; printf "${DIM}Completed in %s${R}\n" "$(elapsed "$start")"
+}
+
+cleanup_worker(){
+    su -c '
+ROOTFS="/data/local/ubuntu-chroot"
+getpids(){
+  for d in /proc/[0-9]*; do
+    [ -e "$d/root" ] || continue
+    r="$(readlink "$d/root" 2>/dev/null)" || continue
+    case "$r" in "$ROOTFS"|"$ROOTFS/"*) echo "${d##*/}";; esac
+  done
+}
+for p in $(getpids); do kill -TERM "$p" 2>/dev/null; done
+sleep 0.65
+for p in $(getpids); do kill -KILL "$p" 2>/dev/null; done
+ps -A -o PID=,NAME=,ARGS= 2>/dev/null | awk -v root="$ROOTFS" '\''($2=="sh"||$2=="bash"||$2=="script") && index($0,root)>0 {print $1}'\'' | while read p; do kill -KILL "$p" 2>/dev/null; done
+'
+}
+
+cleanup_all(){
+    check_root
+    local before_mem before_swap after_mem after_swap gained swap_freed start worker remaining wrappers
+    before_mem="$(mem_available_kb)"; before_swap="$(swap_used_kb)"; start="$(now_ms)"
+    if [ -f "$CLEAN_STAMP" ] && [ ! -f "$LOCK_FILE" ]; then echo; printf "${B}Stopping Ubuntu${R}\n"; printf '%s\n' '--------------------------------------------------'; ok "Already clean"; printf "RAM available : %s\n" "$(fmt_gb "$before_mem")"; printf "${DIM}Completed in %s${R}\n\n" "$(elapsed "$start")"; return 0; fi
+    echo; printf "${B}Stopping Ubuntu${R}\n"; printf '%s\n' '--------------------------------------------------'
+    cleanup_worker & worker=$!; spinner_wait "$worker" "Stopping Ubuntu processes" || true
+    rm -f "$LOCK_FILE"; printf "${B}[•]${R} Verifying cleanup...\n"
+    remaining="$(rootfs_pids | wc -l | tr -d ' ')"; wrappers="$(wrapper_pids | wc -l | tr -d ' ')"
+    if [ "$remaining" -eq 0 ] && [ "$wrappers" -eq 0 ]; then ok "No orphan processes remain"; mark_clean; else warn "Remaining: $remaining processes, $wrappers wrappers"; rm -f "$CLEAN_STAMP"; fi
+    after_mem="$(mem_available_kb)"; after_swap="$(swap_used_kb)"; gained=$((after_mem-before_mem)); swap_freed=$((before_swap-after_swap)); [ "$gained" -lt 0 ] && gained=0; [ "$swap_freed" -lt 0 ] && swap_freed=0
+    echo; printf 'RAM available : %s -> %s\n' "$(fmt_gb "$before_mem")" "$(fmt_gb "$after_mem")"; printf 'RAM gained    : %s\n' "$(fmt_mb "$gained")"; printf 'Swap reclaimed: %s\n' "$(fmt_mb "$swap_freed")"; printf "${DIM}Completed in %s${R}\n\n" "$(elapsed "$start")"
+}
+
+is_mounted(){ su -c "grep -F ' $1 ' /proc/self/mountinfo >/dev/null 2>&1"; }
+prepare_mounts(){
+    if ! is_mounted "$ROOTFS"; then su -c "mount -o bind '$ROOTFS' '$ROOTFS'" || return 1; fi
+    su -c "mount -o remount,bind,rw,suid '$ROOTFS'" >/dev/null 2>&1
+    if ! is_mounted "$ROOTFS/proc"; then su -c "mount -t proc proc '$ROOTFS/proc'" || return 1; fi
+    if ! is_mounted "$ROOTFS/sys"; then su -c "mount -o bind /sys '$ROOTFS/sys'" || return 1; fi
+    if ! is_mounted "$ROOTFS/dev"; then su -c "mount -o bind /dev '$ROOTFS/dev'" || return 1; fi
+    su -c "mkdir -p '$ROOTFS/dev/pts'"
+    if ! is_mounted "$ROOTFS/dev/pts"; then su -c "mount -t devpts devpts '$ROOTFS/dev/pts'" || return 1; fi
+    su -c "chown root:root '$ROOTFS/usr/bin/sudo' 2>/dev/null; chmod 4755 '$ROOTFS/usr/bin/sudo' 2>/dev/null"
+    su -c "grep -qE '^127\\.0\\.0\\.1[[:space:]]+.*localhost' '$ROOTFS/etc/hosts' 2>/dev/null || printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n' >> '$ROOTFS/etc/hosts'"
+}
+
+start_ubuntu(){
+    check_root; check_rootfs
+    local stale=0 prep rc
+    if lock_is_alive; then warn "Ubuntu session is already running."; echo; echo "Use: ub status | ub stop | ub reset"; echo; return 2; fi
+    if [ -f "$LOCK_FILE" ]; then stale=1; elif [ ! -f "$CLEAN_STAMP" ]; then [ -n "$(rootfs_pids | head -n1)" ] && stale=1; [ -n "$(wrapper_pids | head -n1)" ] && stale=1; fi
+    if [ "$stale" -eq 1 ]; then warn "Stale/orphaned Ubuntu detected."; cleanup_all; else ok "No stale session"; fi
+    prepare_mounts & prep=$!; spinner_wait "$prep" "Preparing Ubuntu mounts" || die "Failed preparing Ubuntu mounts."
+    create_lock; trap 'rm -f "$LOCK_FILE"' EXIT
+    echo; printf "${G}Ubuntu 24.04 chroot${R}\n"; printf "${DIM}single-session • orphan protection • cleanup on exit${R}\n\n"
+    su -c "$SCRIPT -qec \"chroot '$ROOTFS' /usr/bin/env -i HOME=/home/coder USER=coder LOGNAME=coder SHELL=/bin/bash TERM='${TERM:-xterm-256color}' LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 TMPDIR=/tmp PATH=/home/coder/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin NPM_CONFIG_PREFIX=/home/coder/.npm-global UB_CHROOT=1 /usr/sbin/runuser -u coder -- /bin/bash -c 'cd /home/coder && exec /bin/bash -l'\" /dev/null"
+    rc=$?; trap - EXIT; echo; info "Ubuntu shell closed."; cleanup_all; return "$rc"
+}
+
+deep_scan(){ rm -f "$CLEAN_STAMP"; show_status; }
+show_help(){ printf "\n${B}UBUNTU CHROOT MANAGER v3${R}\n\n  ${G}ub${R}          masuk Ubuntu\n  ${G}ub status${R}   cek proses + RAM\n  ${G}ub stop${R}     matikan Ubuntu + child processes\n  ${G}ub reset${R}    bersihkan + masuk ulang\n  ${G}ub scan${R}     deep scan proses yatim\n  ${G}ub help${R}     bantuan\n\n"; }
+
+case "${1:-start}" in
+  start) start_ubuntu;;
+  status|stat|s) show_status;;
+  stop|kill) cleanup_all;;
+  reset|restart) cleanup_all; start_ubuntu;;
+  scan|doctor) deep_scan;;
+  help|-h|--help) show_help;;
+  *) err "Unknown command: $1"; show_help; exit 1;;
+esac
